@@ -19,22 +19,16 @@ name: Multi-Environment CI/CD Workflow
           - dev
 
 jobs:
-  build-and-push:
+  build-scan-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v1
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }} # Assuming GITHUB_TOKEN is used here
-
-      - name: Build and push Docker image with environment-specific tag
+      # Build Docker image
+      - name: Build Docker image with environment-specific tag
+        id: build
         run: |
-          IMAGE_TAG=latest
           ENVIRONMENT=""
           if [[ $GITHUB_REF_NAME == 'dev' ]]; then
             ENVIRONMENT="dev"
@@ -43,32 +37,51 @@ jobs:
           elif [[ $GITHUB_REF_NAME == 'main' ]]; then
             ENVIRONMENT="prod"
           fi
+          IMAGE_TAG="latest"
           IMAGE_NAME="ghcr.io/${{ github.repository_owner }}/app:${ENVIRONMENT}-${IMAGE_TAG}"
-          docker build -t $IMAGE_NAME $ENVIRONMENT/ # Assuming there's a Dockerfile in each directory
-          docker push $IMAGE_NAME
+          docker build -t $IMAGE_NAME $ENVIRONMENT/ # Assumes Dockerfile in each directory
+          echo "::set-output name=image_name::$IMAGE_NAME"
+      
+      # Push Docker image to registry
+      - name: Push Docker image to GitHub Container Registry
+        run: |
+          echo ${{ secrets.GITHUB_TOKEN }} | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker push ${{ steps.build.outputs.image_name }}
 
-  terraform-deploy:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v2
+      # Scan Docker image with Trivy
+      - name: Scan the Docker image with Trivy
+        run: |
+          trivy image --severity CRITICAL,HIGH --no-progress ${{ steps.build.outputs.image_name }}
 
+      # Setup Python for Checkov
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.x'
+
+      # Install Checkov
+      - name: Install Checkov
+        run: pip install checkov
+
+      # Run Checkov against Terraform files
+      - name: Run Checkov
+        run: checkov -d ${{ steps.set-dir.outputs.TF_DIR }}
+
+      # Set Terraform Directory
       - name: Set Terraform Directory
         id: set-dir
         run: |
-          ENVIRONMENT=""
           if [[ $GITHUB_REF_NAME == 'dev' ]]; then
-            ENVIRONMENT="Dev"
+            echo "::set-output name=TF_DIR::Dev"
           elif [[ $GITHUB_REF_NAME == 'staging' ]]; then
-            ENVIRONMENT="Staging"
+            echo "::set-output name=TF_DIR::Staging"
           elif [[ $GITHUB_REF_NAME == 'main' ]]; then
-            ENVIRONMENT="Prod"
+            echo "::set-output name=TF_DIR::Prod"
           elif [[ ${{ github.event_name }} == 'workflow_dispatch' ]]; then
-            ENVIRONMENT="${{ github.event.inputs.environment }}"
+            echo "::set-output name=TF_DIR::${{ github.event.inputs.environment }}"
           fi
-          echo "::set-output name=TF_DIR::$ENVIRONMENT"
 
+      # Setup AWS credentials
       - name: Set up AWS credentials
         uses: aws-actions/configure-aws-credentials@v1
         with:
@@ -76,14 +89,12 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: 'us-east-1'
 
+      # Setup Terraform
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v1
 
+      # Initialize and apply Terraform
       - name: Terraform Init and Apply
         run: |
-          TF_DIR=${{ steps.set-dir.outputs.TF_DIR }}
-          terraform -chdir=$TF_DIR init
-          terraform -chdir=$TF_DIR apply -auto-approve
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          terraform -chdir=${{ steps.set-dir.outputs.TF_DIR }} init
+          terraform -chdir=${{ steps.set-dir.outputs.TF_DIR }} apply -auto-approve
