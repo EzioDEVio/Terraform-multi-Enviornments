@@ -1,0 +1,81 @@
+name: CI/CD Workflow
+
+#on:
+  push:
+    branches:
+      - dev
+      - staging
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deploy to Environment'
+        required: true
+        default: 'production'
+        type: 'choice'
+        options:
+          - production
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_PAT }}
+
+      - name: Build and push Docker image with environment-specific tag
+        run: |
+          if [[ $GITHUB_REF_NAME == 'dev' ]]; then
+            IMAGE_TAG=dev-latest
+            GHCR_PAT=${{ secrets.GHCR_PAT_DEV }}
+          elif [[ $GITHUB_REF_NAME == 'staging' ]]; then
+            IMAGE_TAG=staging-latest
+            GHCR_PAT=${{ secrets.GHCR_PAT_STAGING }}
+          elif [[ $GITHUB_REF_NAME == 'production' || ${{ github.event.inputs.environment }} == 'production' ]]; then
+            IMAGE_TAG=prod-latest
+            GHCR_PAT=${{ secrets.GHCR_PAT_PROD }}
+          fi
+
+          echo $GHCR_PAT | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker build . -t ghcr.io/${{ github.repository_owner }}/app:$IMAGE_TAG
+          docker push ghcr.io/${{ github.repository_owner }}/app:$IMAGE_TAG
+
+  terraform-deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/staging' || github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
+    environment:
+      name: ${{ github.head_ref == 'staging' && 'staging' || (github.event.inputs.environment == 'production' && 'production') }}
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: Set up AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v1
+
+      - name: Terraform Initialize and Apply
+        run: |
+          if [[ $GITHUB_REF_NAME == 'staging' ]]; then
+            WORKSPACE='staging'
+            AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID_STAGING }}
+            AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY_STAGING }}
+          elif [[ $GITHUB_REF_NAME == 'production' || ${{ github.event.inputs.environment }} == 'production' ]]; then
+            WORKSPACE='production'
+            AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+            AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+          fi
+
+          terraform workspace select $WORKSPACE || terraform workspace new $WORKSPACE
+          terraform init
+          terraform apply -auto-approve
