@@ -1,6 +1,6 @@
 name: Terraform Deployment Workflow
 
-on:
+#on:
   workflow_dispatch:
     inputs:
       environment:
